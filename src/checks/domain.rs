@@ -66,7 +66,7 @@ impl Registry {
     ) -> CheckResult {
         let shown = unicode(&target.registrable);
         let mut result = CheckResult::new(CheckKind::Domain, &shown);
-        let (info, source) = match self.lookup(&target.registrable).await {
+        let (info, source) = match self.lookup(&target.registrable, lang).await {
             Lookup::Found(info, source) => (info, source),
             Lookup::NotRegistered => {
                 result.add(
@@ -182,7 +182,7 @@ impl Registry {
         result
     }
 
-    async fn lookup(&self, domain: &str) -> Lookup {
+    async fn lookup(&self, domain: &str, lang: Lang) -> Lookup {
         let tld = domain.rsplit('.').next().unwrap_or(domain);
         let whois_only = WHOIS_SERVERS.iter().find(|(zone, _)| *zone == tld);
         let mut rdap_error = None;
@@ -197,7 +197,7 @@ impl Registry {
         }
         let server = match whois_only {
             Some((_, server)) => server.to_string(),
-            None => match self.whois_server(tld).await {
+            None => match self.whois_server(tld, lang).await {
                 Some(server) => server,
                 None => {
                     return Lookup::Failed(rdap_error.unwrap_or_else(|| {
@@ -206,8 +206,13 @@ impl Registry {
                 }
             },
         };
-        // WHOIS servers (the .ru one especially) are often slow; give them extra time.
-        match whois(&server, domain, self.wait * 2).await {
+        // WHOIS servers (the .ru one especially) sometimes stall; a fresh connection
+        // usually gets an answer at once.
+        let mut answer = whois(&server, domain, self.wait, lang).await;
+        if answer.is_err() {
+            answer = whois(&server, domain, self.wait, lang).await;
+        }
+        match answer {
             Ok(text) => match parse_whois(&text) {
                 Some(info) => Lookup::Found(info, server),
                 None => Lookup::NotRegistered,
@@ -253,8 +258,8 @@ impl Registry {
     }
 
     /// Asks IANA which WHOIS server serves the zone.
-    async fn whois_server(&self, tld: &str) -> Option<String> {
-        let answer = whois("whois.iana.org", tld, self.wait).await.ok()?;
+    async fn whois_server(&self, tld: &str, lang: Lang) -> Option<String> {
+        let answer = whois("whois.iana.org", tld, self.wait, lang).await.ok()?;
         answer.lines().find_map(|line| {
             let (key, value) = line.split_once(':')?;
             (key.trim().eq_ignore_ascii_case("whois") && !value.trim().is_empty())
@@ -465,7 +470,7 @@ fn month_by_name(name: &str) -> Option<Month> {
     Month::try_from(index as u8 + 1).ok()
 }
 
-async fn whois(server: &str, query: &str, wait: Duration) -> Result<String, String> {
+async fn whois(server: &str, query: &str, wait: Duration, lang: Lang) -> Result<String, String> {
     let request = async {
         let mut stream = TcpStream::connect((server, 43)).await?;
         stream.write_all(format!("{query}\r\n").as_bytes()).await?;
@@ -475,7 +480,10 @@ async fn whois(server: &str, query: &str, wait: Duration) -> Result<String, Stri
     };
     timeout(wait, request)
         .await
-        .map_err(|_| format!("no answer within {} s", wait.as_secs()))?
+        .map_err(|_| {
+            let secs = wait.as_secs();
+            tr!(lang, "no answer within {secs} s", "нет ответа за {secs} с")
+        })?
         .map_err(|e| e.to_string())
 }
 
